@@ -13,6 +13,7 @@ use jni::{
     sys::{jboolean, jbyte, jchar, jdouble, jfloat, jint, jlong, jobject, jshort, jsize},
     JNIEnv,
 };
+use jni::reftype::RefType;
 
 mod util;
 use util::{attach_current_thread, unwrap};
@@ -995,6 +996,20 @@ fn auto_local_null() {
         let auto_ref = AutoLocal::new(null_obj, &env);
         assert!(auto_ref.is_null());
     }
+}
+
+#[test]
+fn get_local_ref_type() {
+    let env = attach_current_thread();
+    let obj = env.new_string("test").unwrap();
+
+    let result = env.new_local_ref::<&JObject>(&null_obj);
+    assert!(result.is_ok());
+    // It refers to a string.
+    assert_eq!(env.get_object_ref_type(&obj).unwrap(), RefType::LocalRefType);
+
+    let result = env.delete_local_ref(obj);
+    assert!(result.is_ok());
 }
 
 #[test]

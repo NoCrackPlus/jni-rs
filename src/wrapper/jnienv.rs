@@ -17,6 +17,7 @@ use crate::{
         JValue, JValueOwned, ReleaseMode, TypeArray, WeakRef,
     },
     signature::{JavaType, Primitive, TypeSignature},
+    reftype::RefType,
     strings::{JNIString, JavaStr},
     sys::{
         self, jarray, jboolean, jbyte, jchar, jdouble, jfloat, jint, jlong, jshort, jsize, jvalue,
@@ -790,6 +791,16 @@ impl<'local> JNIEnv<'local> {
         let raw = obj.into().into_raw();
         jni_unchecked!(self.internal, DeleteLocalRef, raw);
         Ok(())
+    }
+
+    /// Returns the type of the specified object reference.
+    pub fn get_object_ref_type<'other_local, O>(&self, obj: O) -> Result<RefType>
+    where
+        O: AsRef<JObject<'other_local>>,
+    {
+        let raw = obj.as_ref().as_raw();
+        let ret = jni_unchecked!(self.internal, GetObjectRefType, raw);
+        Ok(RefType::from_raw(ret))
     }
 
     /// Creates a new local reference frame, in which at least a given number

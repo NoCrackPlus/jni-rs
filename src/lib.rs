@@ -209,6 +209,9 @@ mod wrapper {
     /// Parser for java type signatures.
     pub mod signature;
 
+    /// JVM reference types.
+    pub mod reftype;
+
     /// Wrappers for object pointers returned from the JVM.
     pub mod objects;
 
