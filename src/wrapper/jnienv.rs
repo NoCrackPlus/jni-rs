@@ -793,6 +793,16 @@ impl<'local> JNIEnv<'local> {
         Ok(())
     }
 
+    /// Deletes the weak reference.
+    pub fn delete_weak_ref<'other_local, O>(&self, obj: O) -> Result<()>
+        where
+            O: Into<JObject<'other_local>>,
+    {
+        let raw = obj.into().into_raw();
+        jni_unchecked!(self.internal, DeleteWeakGlobalRef, raw);
+        Ok(())
+    }
+
     /// Returns the type of the specified object reference.
     pub fn get_object_ref_type<'other_local, O>(&self, obj: O) -> Result<RefType>
     where
@@ -824,7 +834,7 @@ impl<'local> JNIEnv<'local> {
     /// references allocated on the current stack frame, except the `result`,
     /// which is returned from this function and remains valid.
     ///
-    /// The resulting `JObject` will be `NULL` iff `result` is `NULL`.
+    /// The resulting `JObject` will be `NULL` if `result` is `NULL`.
     ///
     /// This method allows direct control of local frames, but it can cause
     /// undefined behavior and is therefore unsafe. Prefer
