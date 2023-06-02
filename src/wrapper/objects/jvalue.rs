@@ -1,27 +1,27 @@
-use std::convert::TryFrom;
+use std::char::{CharTryFromError, DecodeUtf16Error};
+use std::convert::{TryFrom, TryInto};
 use std::fmt::Debug;
 
 use log::trace;
 
 use crate::{errors::*, objects::JObject, signature::Primitive, sys::*};
 
-/// Rusty version of the JNI C `jvalue` enum. Used in Java method call arguments
-/// and returns.
+#[cfg(doc)]
+use crate::JNIEnv;
+
+/// A Java owned local reference or primitive value.
 ///
-/// `JValueGen` is a generic type, meant to represent both owned and borrowed
-/// JNI values. The type parameter `O` refers to what kind of object reference
-/// the `JValueGen` can hold, which is either:
+/// This type is used for values returned from Java method calls. If the Java
+/// method returns an object reference, it will take the form of an owned
+/// [`JObject`].
 ///
-/// * an owned [`JObject`], used for values returned from a Java method call,
-///   or
-/// * a borrowed `&JObject`, used for parameters passed to a Java method call.
-///
-/// These two cases are represented by the type aliases [`JValueOwned`] and
-/// [`JValue`], respectively.
+/// See also [`JValue`], which is used for Java method call parameters. It is
+/// different from this type in that it *borrows* an object reference instead
+/// of owning one.
 #[allow(missing_docs)]
-#[derive(Clone, Copy, Debug)]
-pub enum JValueGen<O> {
-    Object(O),
+#[derive(Debug)]
+pub enum JValueOwned<'local> {
+    Object(JObject<'local>),
     Byte(jbyte),
     Char(jchar),
     Short(jshort),
@@ -33,39 +33,164 @@ pub enum JValueGen<O> {
     Void,
 }
 
-/// An <dfn>owned</dfn> [`JValueGen`].
-///
-/// This type is used for values returned from Java method calls. If the Java
-/// method returns an object reference, it will take the form of an owned
-/// [`JObject`].
-pub type JValueOwned<'local> = JValueGen<JObject<'local>>;
-
-/// A <dfn>reference</dfn> [`JValueGen`].
+/// A Java borrowed local reference or primitive value.
 ///
 /// This type is used for parameters passed to Java method calls. If the Java
 /// method is to be passed an object reference, it takes the form of a borrowed
 /// <code>&[JObject]</code>.
-pub type JValue<'local, 'obj_ref> = JValueGen<&'obj_ref JObject<'local>>;
+///
+/// See also [`JValueOwned`], which is used for Java method return values. It is
+/// different from this type in that it *owns* an object reference instead
+/// of borrowing one.
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug)]
+pub enum JValue<'obj_ref> {
+    Object(&'obj_ref JObject<'obj_ref>),
+    Byte(jbyte),
+    Char(jchar),
+    Short(jshort),
+    Int(jint),
+    Long(jlong),
+    Bool(jboolean),
+    Float(jfloat),
+    Double(jdouble),
+    Void,
+}
 
-impl<O> JValueGen<O> {
+impl<'local> JValueOwned<'local> {
     /// Convert the enum to its jni-compatible equivalent.
-    pub fn as_jni<'local>(&self) -> jvalue
-    where
-        O: AsRef<JObject<'local>> + Debug,
-    {
+    pub fn as_jni(&self) -> jvalue {
+        self.borrow().as_jni()
+    }
+
+    /// Get the type name for the enum variant.
+    pub fn type_name(&self) -> &'static str {
+        self.borrow().type_name()
+    }
+
+    /// Get the primitive type for the enum variant. If it's not a primitive
+    /// (i.e. an Object), returns None.
+    pub fn primitive_type(&self) -> Option<Primitive> {
+        self.borrow().primitive_type()
+    }
+
+    /// Try to unwrap to an Object.
+    pub fn l(self) -> Result<JObject<'local>> {
+        match self {
+            Self::Object(obj) => Ok(obj),
+            _ => Err(Error::WrongJValueType("object", self.type_name())),
+        }
+    }
+
+    /// Try to unwrap to a boolean.
+    pub fn z(self) -> Result<bool> {
+        self.borrow().z()
+    }
+
+    /// Try to unwrap to a byte.
+    pub fn b(self) -> Result<jbyte> {
+        self.borrow().b()
+    }
+
+    /// Try to unwrap to a char.
+    pub fn c(self) -> Result<jchar> {
+        self.borrow().c()
+    }
+
+    /// Try to unwrap a Java `char` and then convert it to a Rust `char`.
+    ///
+    /// **Warning:** This conversion is likely to fail. Using it is not recommended. Prefer [`JValueGen::i_char`] where possible. See [`char_from_java`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// This method can fail with two kinds of errors:
+    ///
+    /// * [`Error::WrongJValueType`]: `self` does not contain a Java `char`.
+    /// * [`Error::InvalidUtf16`]: `self` contains a Java `char`, but it is one half of a surrogate pair.
+    pub fn c_char(self) -> Result<char> {
+        let char = self.c()?;
+
+        char_from_java(char).map_err(|source| Error::InvalidUtf16 { source })
+    }
+
+    /// Try to unwrap to a double.
+    pub fn d(self) -> Result<jdouble> {
+        self.borrow().d()
+    }
+
+    /// Try to unwrap to a float.
+    pub fn f(self) -> Result<jfloat> {
+        self.borrow().f()
+    }
+
+    /// Try to unwrap to an int.
+    pub fn i(self) -> Result<jint> {
+        self.borrow().i()
+    }
+
+    /// Try to unwrap a Rust `char` from a Java `int`. See [`char_from_java_int`] for details.
+    ///
+    /// # Errors
+    ///
+    /// This method can fail with two kinds of errors:
+    ///
+    /// * [`Error::WrongJValueType`]: `self` does not contain a Java `int`.
+    /// * [`Error::InvalidUtf32`]: `self` contains a Java `int`, but it is not a valid UTF-32 unit.
+    pub fn i_char(self) -> Result<char> {
+        let char = self.i()?;
+
+        char_from_java_int(char).map_err(|source| Error::InvalidUtf32 { char, source })
+    }
+
+    /// Try to unwrap to a long.
+    pub fn j(self) -> Result<jlong> {
+        self.borrow().j()
+    }
+
+    /// Try to unwrap to a short.
+    pub fn s(self) -> Result<jshort> {
+        self.borrow().s()
+    }
+
+    /// Try to unwrap to a void.
+    pub fn v(self) -> Result<()> {
+        self.borrow().v()
+    }
+
+    /// Copies or borrows the value in this `JValueOwned`.
+    ///
+    /// If the value is a primitive type, it is copied. If the value is an
+    /// object reference, it is borrowed.
+    pub fn borrow(&self) -> JValue {
+        match self {
+            Self::Object(o) => JValue::Object(o),
+            Self::Byte(v) => JValue::Byte(*v),
+            Self::Char(v) => JValue::Char(*v),
+            Self::Short(v) => JValue::Short(*v),
+            Self::Int(v) => JValue::Int(*v),
+            Self::Long(v) => JValue::Long(*v),
+            Self::Bool(v) => JValue::Bool(*v),
+            Self::Float(v) => JValue::Float(*v),
+            Self::Double(v) => JValue::Double(*v),
+            Self::Void => JValue::Void,
+        }
+    }
+}
+
+impl<'obj_ref> JValue<'obj_ref> {
+    /// Convert the enum to its jni-compatible equivalent.
+    pub fn as_jni(&self) -> jvalue {
         let val: jvalue = match self {
-            JValueGen::Object(obj) => jvalue {
-                l: obj.as_ref().as_raw(),
-            },
-            JValueGen::Byte(byte) => jvalue { b: *byte },
-            JValueGen::Char(char) => jvalue { c: *char },
-            JValueGen::Short(short) => jvalue { s: *short },
-            JValueGen::Int(int) => jvalue { i: *int },
-            JValueGen::Long(long) => jvalue { j: *long },
-            JValueGen::Bool(boolean) => jvalue { b: *boolean as i8 },
-            JValueGen::Float(float) => jvalue { f: *float },
-            JValueGen::Double(double) => jvalue { d: *double },
-            JValueGen::Void => jvalue {
+            Self::Object(obj) => jvalue { l: obj.as_raw() },
+            Self::Byte(byte) => jvalue { b: *byte },
+            Self::Char(char) => jvalue { c: *char },
+            Self::Short(short) => jvalue { s: *short },
+            Self::Int(int) => jvalue { i: *int },
+            Self::Long(long) => jvalue { j: *long },
+            Self::Bool(boolean) => jvalue { b: *boolean as i8 },
+            Self::Float(float) => jvalue { f: *float },
+            Self::Double(double) => jvalue { d: *double },
+            Self::Void => jvalue {
                 l: ::std::ptr::null_mut(),
             },
         };
@@ -77,26 +202,23 @@ impl<O> JValueGen<O> {
 
     /// Convert the enum to its jni-compatible equivalent.
     #[deprecated = "Use `as_jni` instead."]
-    pub fn to_jni<'local>(self) -> jvalue
-    where
-        O: AsRef<JObject<'local>> + Debug,
-    {
+    pub fn to_jni(self) -> jvalue {
         self.as_jni()
     }
 
     /// Get the type name for the enum variant.
     pub fn type_name(&self) -> &'static str {
         match *self {
-            JValueGen::Void => "void",
-            JValueGen::Object(_) => "object",
-            JValueGen::Byte(_) => "byte",
-            JValueGen::Char(_) => "char",
-            JValueGen::Short(_) => "short",
-            JValueGen::Int(_) => "int",
-            JValueGen::Long(_) => "long",
-            JValueGen::Bool(_) => "bool",
-            JValueGen::Float(_) => "float",
-            JValueGen::Double(_) => "double",
+            Self::Void => "void",
+            Self::Object(_) => "object",
+            Self::Byte(_) => "byte",
+            Self::Char(_) => "char",
+            Self::Short(_) => "short",
+            Self::Int(_) => "int",
+            Self::Long(_) => "long",
+            Self::Bool(_) => "bool",
+            Self::Float(_) => "float",
+            Self::Double(_) => "double",
         }
     }
 
@@ -104,23 +226,23 @@ impl<O> JValueGen<O> {
     /// (i.e. an Object), returns None.
     pub fn primitive_type(&self) -> Option<Primitive> {
         Some(match *self {
-            JValueGen::Object(_) => return None,
-            JValueGen::Void => Primitive::Void,
-            JValueGen::Byte(_) => Primitive::Byte,
-            JValueGen::Char(_) => Primitive::Char,
-            JValueGen::Short(_) => Primitive::Short,
-            JValueGen::Int(_) => Primitive::Int,
-            JValueGen::Long(_) => Primitive::Long,
-            JValueGen::Bool(_) => Primitive::Boolean,
-            JValueGen::Float(_) => Primitive::Float,
-            JValueGen::Double(_) => Primitive::Double,
+            Self::Object(_) => return None,
+            Self::Void => Primitive::Void,
+            Self::Byte(_) => Primitive::Byte,
+            Self::Char(_) => Primitive::Char,
+            Self::Short(_) => Primitive::Short,
+            Self::Int(_) => Primitive::Int,
+            Self::Long(_) => Primitive::Long,
+            Self::Bool(_) => Primitive::Boolean,
+            Self::Float(_) => Primitive::Float,
+            Self::Double(_) => Primitive::Double,
         })
     }
 
     /// Try to unwrap to an Object.
-    pub fn l(self) -> Result<O> {
+    pub fn l(self) -> Result<&'obj_ref JObject<'obj_ref>> {
         match self {
-            JValueGen::Object(obj) => Ok(obj),
+            Self::Object(obj) => Ok(obj),
             _ => Err(Error::WrongJValueType("object", self.type_name())),
         }
     }
@@ -128,7 +250,7 @@ impl<O> JValueGen<O> {
     /// Try to unwrap to a boolean.
     pub fn z(self) -> Result<bool> {
         match self {
-            JValueGen::Bool(b) => Ok(b == JNI_TRUE),
+            Self::Bool(b) => Ok(b == JNI_TRUE),
             _ => Err(Error::WrongJValueType("bool", self.type_name())),
         }
     }
@@ -136,7 +258,7 @@ impl<O> JValueGen<O> {
     /// Try to unwrap to a byte.
     pub fn b(self) -> Result<jbyte> {
         match self {
-            JValueGen::Byte(b) => Ok(b),
+            Self::Byte(b) => Ok(b),
             _ => Err(Error::WrongJValueType("jbyte", self.type_name())),
         }
     }
@@ -144,15 +266,31 @@ impl<O> JValueGen<O> {
     /// Try to unwrap to a char.
     pub fn c(self) -> Result<jchar> {
         match self {
-            JValueGen::Char(b) => Ok(b),
+            Self::Char(b) => Ok(b),
             _ => Err(Error::WrongJValueType("jchar", self.type_name())),
         }
+    }
+
+    /// Try to unwrap a Java `char` and then convert it to a Rust `char`.
+    ///
+    /// **Warning:** This conversion is likely to fail. Using it is not recommended. Prefer [`JValueGen::i_char`] where possible. See [`char_from_java`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// This method can fail with two kinds of errors:
+    ///
+    /// * [`Error::WrongJValueType`]: `self` does not contain a Java `char`.
+    /// * [`Error::InvalidUtf16`]: `self` contains a Java `char`, but it is one half of a surrogate pair.
+    pub fn c_char(self) -> Result<char> {
+        let char = self.c()?;
+
+        char_from_java(char).map_err(|source| Error::InvalidUtf16 { source })
     }
 
     /// Try to unwrap to a double.
     pub fn d(self) -> Result<jdouble> {
         match self {
-            JValueGen::Double(b) => Ok(b),
+            Self::Double(b) => Ok(b),
             _ => Err(Error::WrongJValueType("jdouble", self.type_name())),
         }
     }
@@ -160,7 +298,7 @@ impl<O> JValueGen<O> {
     /// Try to unwrap to a float.
     pub fn f(self) -> Result<jfloat> {
         match self {
-            JValueGen::Float(b) => Ok(b),
+            Self::Float(b) => Ok(b),
             _ => Err(Error::WrongJValueType("jfloat", self.type_name())),
         }
     }
@@ -168,15 +306,29 @@ impl<O> JValueGen<O> {
     /// Try to unwrap to an int.
     pub fn i(self) -> Result<jint> {
         match self {
-            JValueGen::Int(b) => Ok(b),
+            Self::Int(b) => Ok(b),
             _ => Err(Error::WrongJValueType("jint", self.type_name())),
         }
+    }
+
+    /// Try to unwrap a Rust `char` from a Java `int`. See [`char_from_java_int`] for details.
+    ///
+    /// # Errors
+    ///
+    /// This method can fail with two kinds of errors:
+    ///
+    /// * [`Error::WrongJValueType`]: `self` does not contain a Java `int`.
+    /// * [`Error::InvalidUtf32`]: `self` contains a Java `int`, but it is not a valid UTF-32 unit.
+    pub fn i_char(self) -> Result<char> {
+        let char = self.i()?;
+
+        char_from_java_int(char).map_err(|source| Error::InvalidUtf32 { char, source })
     }
 
     /// Try to unwrap to a long.
     pub fn j(self) -> Result<jlong> {
         match self {
-            JValueGen::Long(b) => Ok(b),
+            Self::Long(b) => Ok(b),
             _ => Err(Error::WrongJValueType("jlong", self.type_name())),
         }
     }
@@ -184,7 +336,7 @@ impl<O> JValueGen<O> {
     /// Try to unwrap to a short.
     pub fn s(self) -> Result<jshort> {
         match self {
-            JValueGen::Short(b) => Ok(b),
+            Self::Short(b) => Ok(b),
             _ => Err(Error::WrongJValueType("jshort", self.type_name())),
         }
     }
@@ -192,33 +344,19 @@ impl<O> JValueGen<O> {
     /// Try to unwrap to a void.
     pub fn v(self) -> Result<()> {
         match self {
-            JValueGen::Void => Ok(()),
+            Self::Void => Ok(()),
             _ => Err(Error::WrongJValueType("void", self.type_name())),
         }
     }
 
-    /// Copies or borrows the value in this `JValue`.
-    ///
-    /// If the value is a primitive type, it is copied. If the value is an
-    /// object reference, it is borrowed.
-    pub fn borrow(&self) -> JValueGen<&O> {
-        match self {
-            JValueGen::Object(o) => JValueGen::Object(o),
-            JValueGen::Byte(v) => JValueGen::Byte(*v),
-            JValueGen::Char(v) => JValueGen::Char(*v),
-            JValueGen::Short(v) => JValueGen::Short(*v),
-            JValueGen::Int(v) => JValueGen::Int(*v),
-            JValueGen::Long(v) => JValueGen::Long(*v),
-            JValueGen::Bool(v) => JValueGen::Bool(*v),
-            JValueGen::Float(v) => JValueGen::Float(*v),
-            JValueGen::Double(v) => JValueGen::Double(*v),
-            JValueGen::Void => JValueGen::Void,
-        }
+    /// Converts a Rust `char` to a Java `int`. See [`char_to_java_int`] for details.
+    pub fn int_from_char(char: char) -> Self {
+        Self::Int(char_to_java_int(char))
     }
 }
 
-impl<'obj_ref, O> From<&'obj_ref JValueGen<O>> for JValueGen<&'obj_ref O> {
-    fn from(other: &'obj_ref JValueGen<O>) -> Self {
+impl<'obj_ref> From<&'obj_ref JValueOwned<'obj_ref>> for JValue<'obj_ref> {
+    fn from(other: &'obj_ref JValueOwned) -> Self {
         other.borrow()
     }
 }
@@ -229,9 +367,7 @@ impl<'local, T: Into<JObject<'local>>> From<T> for JValueOwned<'local> {
     }
 }
 
-impl<'local: 'obj_ref, 'obj_ref, T: AsRef<JObject<'local>>> From<&'obj_ref T>
-    for JValue<'local, 'obj_ref>
-{
+impl<'obj_ref, T: AsRef<JObject<'obj_ref>>> From<&'obj_ref T> for JValue<'obj_ref> {
     fn from(other: &'obj_ref T) -> Self {
         Self::Object(other.as_ref())
     }
@@ -241,177 +377,399 @@ impl<'local> TryFrom<JValueOwned<'local>> for JObject<'local> {
     type Error = Error;
 
     fn try_from(value: JValueOwned<'local>) -> Result<Self> {
-        match value {
-            JValueGen::Object(o) => Ok(o),
-            _ => Err(Error::WrongJValueType("object", value.type_name())),
-        }
+        value.l()
     }
 }
 
-impl<O> From<bool> for JValueGen<O> {
+impl<'local> From<bool> for JValueOwned<'local> {
     fn from(other: bool) -> Self {
-        JValueGen::Bool(if other { JNI_TRUE } else { JNI_FALSE })
+        Self::Bool(if other { JNI_TRUE } else { JNI_FALSE })
+    }
+}
+
+impl<'obj_ref> From<bool> for JValue<'obj_ref> {
+    fn from(other: bool) -> Self {
+        Self::Bool(if other { JNI_TRUE } else { JNI_FALSE })
     }
 }
 
 // jbool
-impl<O> From<jboolean> for JValueGen<O> {
+impl<'local> From<jboolean> for JValueOwned<'local> {
     fn from(other: jboolean) -> Self {
-        JValueGen::Bool(other)
+        Self::Bool(other)
     }
 }
 
-impl<O> TryFrom<JValueGen<O>> for jboolean {
+impl<'local> TryFrom<JValueOwned<'local>> for jboolean {
     type Error = Error;
 
-    fn try_from(value: JValueGen<O>) -> Result<Self> {
+    fn try_from(value: JValueOwned) -> Result<Self> {
+        value.borrow().try_into()
+    }
+}
+
+impl<'obj_ref> From<jboolean> for JValue<'obj_ref> {
+    fn from(other: jboolean) -> Self {
+        Self::Bool(other)
+    }
+}
+
+impl<'obj_ref> TryFrom<JValue<'obj_ref>> for jboolean {
+    type Error = Error;
+
+    fn try_from(value: JValue) -> Result<Self> {
         match value {
-            JValueGen::Bool(b) => Ok(b),
+            JValue::Bool(b) => Ok(b),
             _ => Err(Error::WrongJValueType("bool", value.type_name())),
         }
     }
 }
 
 // jchar
-impl<O> From<jchar> for JValueGen<O> {
+impl<'local> From<jchar> for JValueOwned<'local> {
     fn from(other: jchar) -> Self {
-        JValueGen::Char(other)
+        Self::Char(other)
     }
 }
 
-impl<O> TryFrom<JValueGen<O>> for jchar {
+impl<'local> TryFrom<JValueOwned<'local>> for jchar {
     type Error = Error;
 
-    fn try_from(value: JValueGen<O>) -> Result<Self> {
-        match value {
-            JValueGen::Char(c) => Ok(c),
-            _ => Err(Error::WrongJValueType("char", value.type_name())),
-        }
+    fn try_from(value: JValueOwned) -> Result<Self> {
+        value.c()
     }
+}
+
+impl<'obj_ref> From<jchar> for JValue<'obj_ref> {
+    fn from(other: jchar) -> Self {
+        Self::Char(other)
+    }
+}
+
+impl<'obj_ref> TryFrom<JValue<'obj_ref>> for jchar {
+    type Error = Error;
+
+    fn try_from(value: JValue) -> Result<Self> {
+        value.c()
+    }
+}
+
+/// Converts a Rust `char` to a Java `char`, if possible.
+///
+/// **Warning:** This conversion is likely to fail. Using it is not recommended. Prefer [`JValueGen::int_from_char`] where possible. See [`char_to_java`] for more information.
+impl<'local> TryFrom<char> for JValueOwned<'local> {
+    type Error = CharToJavaError;
+
+    fn try_from(value: char) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::Char(char_to_java(value)?))
+    }
+}
+
+/// Converts a Rust `char` to a Java `char`, if possible.
+///
+/// **Warning:** This conversion is likely to fail. Using it is not recommended. Prefer [`JValueGen::int_from_char`] where possible. See [`char_to_java`] for more information.
+impl<'obj_ref> TryFrom<char> for JValue<'obj_ref> {
+    type Error = CharToJavaError;
+
+    fn try_from(value: char) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::Char(char_to_java(value)?))
+    }
+}
+
+/// Converts a Java `char` to a Rust `char`, if possible. (Error-prone; see warning.)
+///
+/// **Warning:** Converting a single Java `char` to a Rust `char` is not recommended. This can only succeed for code points up to U+FFFF. Code points above that are represented in Java as *two* `char`s, each representing one half of a UTF-16 [surrogate pair], which this function cannot handle. If possible, use one of these alternatives instead:
+///
+/// * Use Java `int`s containing UTF-32. You can encode a Java `String` as a sequence of UTF-32 `int`s using its [`codePoints`] method, then use [`char_from_java_int`] to convert each one to a Rust `char`.
+///
+/// * Convert a Java `String` using [`JNIEnv::get_string`].
+///
+/// * Convert multiple Java `char`s at a time (such as in a Java `char[]` array) using [`char::decode_utf16`] (which this function is a simple wrapper around). That will properly convert any surrogate pairs among the Java `char`s.
+///
+/// # See Also
+///
+/// * [`JValueGen::c_char`], a wrapper around this function that unwraps [`JValueGen::Char`]
+/// * [`char_to_java`], the opposite of this function
+/// * [`char_from_java_int`], a UTF-32 alternative to this function that is unlikely to fail
+///
+/// # Errors
+///
+/// This function returns an error if the provided Java `char` is part of a UTF-16 surrogate pair, which cannot be converted to a Rust `char` by itself.
+///
+/// [`codePoints`]: https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/lang/String.html#codePoints()
+/// [surrogate pair]: https://en.wikipedia.org/wiki/Surrogate_pair
+pub fn char_from_java(char: jchar) -> std::result::Result<char, DecodeUtf16Error> {
+    char::decode_utf16([char]).next().unwrap()
+}
+
+/// Converts a Rust `char` to a Java `char`, if possible. (Error-prone; see warning.)
+///
+/// **Warning:** Converting a Rust `char` to a single Java `char` is not recommended. This can only succeed for code points up to U+FFFF. Code points above that are represented in Java as *two* `char`s, each representing one half of a UTF-16 [surrogate pair], which this function cannot handle. If possible, use one of these alternatives instead:
+///
+/// * Use Java `int`s containing UTF-32. You can convert a Rust `char` to a Java `int` containing UTF-32 using [`char_to_java_int`], which never fails.
+///
+/// * Convert a Rust [`str`] to a Java `String` using [`JNIEnv::new_string`].
+///
+/// * Convert a Rust `char` to multiple Java `char`s at a time using [`char::encode_utf16`] (which this function is a wrapper around). That will properly generate surrogate pairs as needed.
+///
+/// # See Also
+///
+/// * [`JValueGen`]'s implementation of `TryFrom<char>`, a wrapper for this function that produces [`JValueGen::Char`]
+/// * [`char_from_java`], the opposite of this function
+/// * [`char_to_java_int`], a UTF-32 alternative to this function that never fails
+///
+/// # Errors
+///
+/// This function returns an error if the provided `char` cannot be represented in UTF-16 without a surrogate pair, and therefore cannot be converted to a single Java `char`.
+///
+/// [surrogate pair]: https://en.wikipedia.org/wiki/Surrogate_pair
+pub fn char_to_java(char: char) -> std::result::Result<jchar, CharToJavaError> {
+    if char.len_utf16() != 1 {
+        return Err(CharToJavaError { char });
+    }
+
+    let mut buf = [0u16; 1];
+    let buf: &mut [u16] = char.encode_utf16(&mut buf);
+    Ok(buf[0])
 }
 
 // jshort
-impl<O> From<jshort> for JValueGen<O> {
+impl<'local> From<jshort> for JValueOwned<'local> {
     fn from(other: jshort) -> Self {
-        JValueGen::Short(other)
+        Self::Short(other)
     }
 }
 
-impl<O> TryFrom<JValueGen<O>> for jshort {
+impl<'local> TryFrom<JValueOwned<'local>> for jshort {
     type Error = Error;
 
-    fn try_from(value: JValueGen<O>) -> Result<Self> {
-        match value {
-            JValueGen::Short(s) => Ok(s),
-            _ => Err(Error::WrongJValueType("short", value.type_name())),
-        }
+    fn try_from(value: JValueOwned) -> Result<Self> {
+        value.s()
+    }
+}
+
+impl<'obj_ref> From<jshort> for JValue<'obj_ref> {
+    fn from(other: jshort) -> Self {
+        Self::Short(other)
+    }
+}
+
+impl<'obj_ref> TryFrom<JValue<'obj_ref>> for jshort {
+    type Error = Error;
+
+    fn try_from(value: JValue) -> Result<Self> {
+        value.s()
     }
 }
 
 // jfloat
-impl<O> From<jfloat> for JValueGen<O> {
+impl<'local> From<jfloat> for JValueOwned<'local> {
     fn from(other: jfloat) -> Self {
-        JValueGen::Float(other)
+        Self::Float(other)
     }
 }
 
-impl<O> TryFrom<JValueGen<O>> for jfloat {
+impl<'local> TryFrom<JValueOwned<'local>> for jfloat {
     type Error = Error;
 
-    fn try_from(value: JValueGen<O>) -> Result<Self> {
-        match value {
-            JValueGen::Float(f) => Ok(f),
-            _ => Err(Error::WrongJValueType("float", value.type_name())),
-        }
+    fn try_from(value: JValueOwned) -> Result<Self> {
+        value.f()
+    }
+}
+
+impl<'obj_ref> From<jfloat> for JValue<'obj_ref> {
+    fn from(other: jfloat) -> Self {
+        Self::Float(other)
+    }
+}
+
+impl<'obj_ref> TryFrom<JValue<'obj_ref>> for jfloat {
+    type Error = Error;
+
+    fn try_from(value: JValue) -> Result<Self> {
+        value.f()
     }
 }
 
 // jdouble
-impl<O> From<jdouble> for JValueGen<O> {
+impl<'local> From<jdouble> for JValueOwned<'local> {
     fn from(other: jdouble) -> Self {
-        JValueGen::Double(other)
+        Self::Double(other)
     }
 }
 
-impl<O> TryFrom<JValueGen<O>> for jdouble {
+impl<'local> TryFrom<JValueOwned<'local>> for jdouble {
     type Error = Error;
 
-    fn try_from(value: JValueGen<O>) -> Result<Self> {
-        match value {
-            JValueGen::Double(d) => Ok(d),
-            _ => Err(Error::WrongJValueType("double", value.type_name())),
-        }
+    fn try_from(value: JValueOwned) -> Result<Self> {
+        value.d()
+    }
+}
+
+impl<'obj_ref> From<jdouble> for JValue<'obj_ref> {
+    fn from(other: jdouble) -> Self {
+        Self::Double(other)
+    }
+}
+
+impl<'obj_ref> TryFrom<JValue<'obj_ref>> for jdouble {
+    type Error = Error;
+
+    fn try_from(value: JValue) -> Result<Self> {
+        value.d()
     }
 }
 
 // jint
-impl<O> From<jint> for JValueGen<O> {
+impl<'local> From<jint> for JValueOwned<'local> {
     fn from(other: jint) -> Self {
-        JValueGen::Int(other)
+        Self::Int(other)
     }
 }
 
-impl<O> TryFrom<JValueGen<O>> for jint {
+impl<'local> TryFrom<JValueOwned<'local>> for jint {
     type Error = Error;
 
-    fn try_from(value: JValueGen<O>) -> Result<Self> {
-        match value {
-            JValueGen::Int(i) => Ok(i),
-            _ => Err(Error::WrongJValueType("int", value.type_name())),
-        }
+    fn try_from(value: JValueOwned) -> Result<Self> {
+        value.i()
     }
+}
+
+impl<'obj_ref> From<jint> for JValue<'obj_ref> {
+    fn from(other: jint) -> Self {
+        Self::Int(other)
+    }
+}
+
+impl<'obj_ref> TryFrom<JValue<'obj_ref>> for jint {
+    type Error = Error;
+
+    fn try_from(value: JValue) -> Result<Self> {
+        value.i()
+    }
+}
+
+/// Converts a Rust `char` to a Java `int`.
+///
+/// This is the form expected or produced by certain Java APIs that process UTF-32 units, such as [`String.codePointAt`].
+///
+/// As discussed in [`char_to_java`], Rust `char` cannot always be converted to Java `char`, but can always be converted to Java `int`. This is the recommended way to pass a Rust `char` to Java code.
+///
+/// # See Also
+///
+/// * [`JValueGen::int_from_char`], a wrapper for this function that returns [`JValueGen::Int`]
+/// * [`char_from_java_int`], the opposite of this function
+/// * [`char_to_java`], an alternative to this function that converts to Java `char` but is likely to fail
+///
+/// [`String.codePointAt`]: https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/lang/String.html#codePointAt(int)
+pub fn char_to_java_int(char: char) -> jint {
+    u32::from(char) as jint
+}
+
+/// Converts a Java `int` to a Rust `char`.
+///
+/// This is the form expected or produced by certain Java APIs that process UTF-32 units, such as [`String.codePointAt`].
+///
+/// As discussed in [`char_from_java`], Rust `char` cannot always be converted from Java `char`, but can always be converted from Java `int` (provided that the `int` contains a valid UTF-32 unit). This is the recommended way to receive a Rust `char` from Java code.
+///
+/// # See Also
+///
+/// * [`JValueGen::i_char`], a wrapper for this function that unwraps [`JValueGen::Int`]
+/// * [`char_to_java_int`], the opposite of this function
+/// * [`char_from_java`], an alternative to this function that converts from Java `char` but is likely to fail
+///
+/// # Errors
+///
+/// Returns an error if the Java `int` doesn't represent a valid UTF-32 unit.
+///
+/// [`String.codePointAt`]: https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/lang/String.html#codePointAt(int)
+pub fn char_from_java_int(jint: jint) -> std::result::Result<char, CharTryFromError> {
+    char::try_from(jint as u32)
 }
 
 // jlong
-impl<O> From<jlong> for JValueGen<O> {
+impl<'local> From<jlong> for JValueOwned<'local> {
     fn from(other: jlong) -> Self {
-        JValueGen::Long(other)
+        Self::Long(other)
     }
 }
 
-impl<O> TryFrom<JValueGen<O>> for jlong {
+impl<'local> TryFrom<JValueOwned<'local>> for jlong {
     type Error = Error;
 
-    fn try_from(value: JValueGen<O>) -> Result<Self> {
-        match value {
-            JValueGen::Long(l) => Ok(l),
-            _ => Err(Error::WrongJValueType("long", value.type_name())),
-        }
+    fn try_from(value: JValueOwned) -> Result<Self> {
+        value.j()
+    }
+}
+
+impl<'obj_ref> From<jlong> for JValue<'obj_ref> {
+    fn from(other: jlong) -> Self {
+        Self::Long(other)
+    }
+}
+
+impl<'obj_ref> TryFrom<JValue<'obj_ref>> for jlong {
+    type Error = Error;
+
+    fn try_from(value: JValue) -> Result<Self> {
+        value.j()
     }
 }
 
 // jbyte
-impl<O> From<jbyte> for JValueGen<O> {
+impl<'local> From<jbyte> for JValueOwned<'local> {
     fn from(other: jbyte) -> Self {
-        JValueGen::Byte(other)
+        Self::Byte(other)
     }
 }
 
-impl<O> TryFrom<JValueGen<O>> for jbyte {
+impl<'local> TryFrom<JValueOwned<'local>> for jbyte {
     type Error = Error;
 
-    fn try_from(value: JValueGen<O>) -> Result<Self> {
-        match value {
-            JValueGen::Byte(b) => Ok(b),
-            _ => Err(Error::WrongJValueType("byte", value.type_name())),
-        }
+    fn try_from(value: JValueOwned) -> Result<Self> {
+        value.b()
+    }
+}
+
+impl<'obj_ref> From<jbyte> for JValue<'obj_ref> {
+    fn from(other: jbyte) -> Self {
+        Self::Byte(other)
+    }
+}
+
+impl<'obj_ref> TryFrom<JValue<'obj_ref>> for jbyte {
+    type Error = Error;
+
+    fn try_from(value: JValue) -> Result<Self> {
+        value.b()
     }
 }
 
 // jvoid
-impl<O> From<()> for JValueGen<O> {
+impl<'local> From<()> for JValueOwned<'local> {
     fn from(_: ()) -> Self {
-        JValueGen::Void
+        Self::Void
     }
 }
 
-impl<O> TryFrom<JValueGen<O>> for () {
+impl<'local> TryFrom<JValueOwned<'local>> for () {
     type Error = Error;
 
-    fn try_from(value: JValueGen<O>) -> Result<Self> {
-        match value {
-            JValueGen::Void => Ok(()),
-            _ => Err(Error::WrongJValueType("void", value.type_name())),
-        }
+    fn try_from(value: JValueOwned) -> Result<Self> {
+        value.v()
+    }
+}
+
+impl<'obj_ref> From<()> for JValue<'obj_ref> {
+    fn from(_: ()) -> Self {
+        Self::Void
+    }
+}
+
+impl<'obj_ref> TryFrom<JValue<'obj_ref>> for () {
+    type Error = Error;
+
+    fn try_from(value: JValue) -> Result<Self> {
+        value.v()
     }
 }
